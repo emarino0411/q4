@@ -1,0 +1,29 @@
+@import 'tailwindcss';
+@plugin '@tailwindcss/forms';
+
+@source '../../vendor/laravel/framework/src/Illuminate/Pagination/resources/views/*.blade.php';
+@source '../../storage/framework/views/*.php';
+
+@theme {
+    --font-sans: 'Figtree', ui-sans-serif, system-ui, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji',
+        'Segoe UI Symbol', 'Noto Color Emoji';
+
+    --color-wimbledon-50:  #f0faf4;
+    --color-wimbledon-100: #d6f0e0;
+    --color-wimbledon-200: #aee0c2;
+    --color-wimbledon-300: #76c99a;
+    --color-wimbledon-400: #3dac6f;
+    --color-wimbledon-500: #1a8f52;
+    --color-wimbledon-600: #046A38;
+    --color-wimbledon-700: #035a2f;
+    --color-wimbledon-800: #034a27;
+    --color-wimbledon-900: #023d20;
+}
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+@layer base {
+    html {
+        font-size: 16px;
+    }
+}
