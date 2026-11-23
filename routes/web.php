@@ -19,13 +19,19 @@ Route::middleware(['auth'])->post('/theme', function (\Illuminate\Http\Request $
     return response()->noContent();
 })->name('theme.save');
 
+Route::middleware(['auth', 'verified', 'super_admin'])->group(function () {
+    Livewire\Volt\Volt::route('/admin', 'admin.dashboard')->name('admin.dashboard');
+});
+
 Route::middleware(['auth', 'verified'])->group(function () {
     Livewire\Volt\Volt::route('/games', 'games')->name('games');
     Livewire\Volt\Volt::route('/games/{game}/queue', 'games.queue')->name('games.queue');
+    Livewire\Volt\Volt::route('/games/{game}/queue-display', 'games.queue-display')->name('games.queue-display');
     Livewire\Volt\Volt::route('/games/{game}/view', 'games.view')->name('games.view');
     Livewire\Volt\Volt::route('/games/{game}/players/{player}', 'games.player-history')->name('games.player-history');
 });
 
 Livewire\Volt\Volt::route('/games/{game}/display', 'games.display')->name('games.display');
+Livewire\Volt\Volt::route('/court/{code}', 'courts.view')->name('court.view');
 
 require __DIR__.'/auth.php';

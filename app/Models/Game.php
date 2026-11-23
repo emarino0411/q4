@@ -14,6 +14,7 @@ class Game extends Model
         'status', 'token', 'started_at',
         'pairing_mode', 'pending_pairing_mode', 'score_type', 'score_limit', 'game_duration',
         'winners_stay', 'auto_assign', 'strict_level', 'queue_wait_threshold',
+        'winner_player_id',
     ];
 
     protected $casts = [
@@ -37,6 +38,11 @@ class Game extends Model
     public function courts(): HasMany
     {
         return $this->hasMany(Court::class)->orderBy('court_number');
+    }
+
+    public function winner(): BelongsTo
+    {
+        return $this->belongsTo(Player::class, 'winner_player_id');
     }
 
     public function isPending(): bool { return $this->status === 'pending'; }

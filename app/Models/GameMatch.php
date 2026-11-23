@@ -10,7 +10,7 @@ class GameMatch extends Model
 {
     protected $table = 'matches';
 
-    protected $fillable = ['court_id', 'status', 'team1_score', 'team2_score', 'started_at', 'finished_at', 'group_fingerprint', 'pairing_mode'];
+    protected $fillable = ['court_id', 'status', 'team1_score', 'team2_score', 'started_at', 'finished_at', 'group_fingerprint', 'pairing_mode', 'request_group_id'];
 
     protected $casts = [
         'started_at'  => 'datetime',

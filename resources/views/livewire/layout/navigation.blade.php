@@ -28,6 +28,11 @@ new class extends Component
                     <x-nav-link :href="route('games')" :active="request()->routeIs('games')" wire:navigate>
                         Games
                     </x-nav-link>
+                    @if (auth()->user()->isSuperAdmin())
+                        <x-nav-link :href="route('admin.dashboard')" :active="request()->routeIs('admin.*')" wire:navigate>
+                            Admin
+                        </x-nav-link>
+                    @endif
                 </div>
             </div>
 
@@ -91,6 +96,11 @@ new class extends Component
             <x-responsive-nav-link :href="route('games')" :active="request()->routeIs('games')" wire:navigate>
                 Games
             </x-responsive-nav-link>
+            @if (auth()->user()->isSuperAdmin())
+                <x-responsive-nav-link :href="route('admin.dashboard')" :active="request()->routeIs('admin.*')" wire:navigate>
+                    Admin
+                </x-responsive-nav-link>
+            @endif
         </div>
         <div class="border-t border-gray-200 dark:border-gray-700 px-4 py-3">
             <div class="text-sm font-medium text-gray-800 dark:text-gray-200"

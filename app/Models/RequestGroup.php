@@ -29,4 +29,9 @@ class RequestGroup extends Model
     {
         return $this->status === 'ready';
     }
+
+    public function isAssigned(): bool
+    {
+        return $this->status === 'assigned';
+    }
 }

@@ -24,6 +24,8 @@ new #[Layout('layouts.app', ['header' => 'Games'])] class extends Component
     public string $qrUrl = '';
     public ?int $endingGameId = null;
     public string $endingGameName = '';
+    public ?int $endingWinnerId = null;
+    public array $endingRankedPlayers = [];
     public ?int $deletingGameId = null;
     public string $deletingGameName = '';
 
@@ -46,7 +48,7 @@ new #[Layout('layouts.app', ['header' => 'Games'])] class extends Component
     public function with(): array
     {
         return [
-            'games' => Auth::user()->games()->withCount(['courts as matches_count' => fn($q) => $q->join('matches', 'courts.id', '=', 'matches.court_id')->where('matches.status', 'finished')])->latest('date')->get(),
+            'games' => Auth::user()->games()->with('winner')->withCount(['courts as matches_count' => fn($q) => $q->join('matches', 'courts.id', '=', 'matches.court_id')->where('matches.status', 'finished')])->latest('date')->get(),
         ];
     }
 
@@ -145,6 +147,22 @@ new #[Layout('layouts.app', ['header' => 'Games'])] class extends Component
         Auth::user()->games()->findOrFail($game->id);
         $this->endingGameId   = $game->id;
         $this->endingGameName = $game->name;
+
+        // Build ranked player list (wins desc → win_pct desc → points desc)
+        $this->endingRankedPlayers = $game->players()
+            ->where(fn($q) => $q->where('wins', '>', 0)->orWhere('losses', '>', 0))
+            ->get()
+            ->map(function ($player) {
+                $games  = $player->wins + $player->losses;
+                $winPct = $games > 0 ? $player->wins / $games : 0;
+                return ['id' => $player->id, 'name' => $player->name, 'wins' => $player->wins, 'losses' => $player->losses, 'win_pct' => $winPct];
+            })
+            ->pipe(fn($col) => $col->sort(fn($a, $b) =>
+                [$b['wins'], $b['win_pct']] <=> [$a['wins'], $a['win_pct']]
+            )->values())
+            ->toArray();
+
+        $this->endingWinnerId = $this->endingRankedPlayers[0]['id'] ?? null;
         $this->dispatch('open-modal', 'confirm-end');
     }
 
@@ -152,8 +170,13 @@ new #[Layout('layouts.app', ['header' => 'Games'])] class extends Component
     {
         $game = Auth::user()->games()->findOrFail($this->endingGameId);
         $game->end();
-        $this->endingGameId   = null;
-        $this->endingGameName = '';
+        if ($this->endingWinnerId) {
+            $game->update(['winner_player_id' => $this->endingWinnerId]);
+        }
+        $this->endingGameId          = null;
+        $this->endingGameName        = '';
+        $this->endingWinnerId        = null;
+        $this->endingRankedPlayers   = [];
         $this->dispatch('close-modal', 'confirm-end');
     }
 
@@ -316,6 +339,9 @@ new #[Layout('layouts.app', ['header' => 'Games'])] class extends Component
                                     <span class="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-wimbledon-100 text-wimbledon-700 dark:bg-wimbledon-900/40 dark:text-wimbledon-400">Ongoing</span>
                                 @else
                                     <span class="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-red-100 text-red-600 dark:bg-red-900/40 dark:text-red-400">Ended</span>
+                                    @if ($game->winner_player_id && $game->winner)
+                                        <span class="inline-flex items-center gap-1 text-xs text-yellow-600 dark:text-yellow-400">🏆 {{ $game->winner->name }}</span>
+                                    @endif
                                 @endif
                             </td>
                             <td class="px-6 py-4 text-gray-600 dark:text-gray-400">{{ $game->players()->count() }}</td>
@@ -374,8 +400,28 @@ new #[Layout('layouts.app', ['header' => 'Games'])] class extends Component
                     <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/></svg>
                 </button>
             </div>
-            <p class="text-sm text-gray-600 dark:text-gray-400 mb-1">Are you sure you want to end <strong class="text-gray-900 dark:text-white">{{ $endingGameName }}</strong>?</p>
-            <p class="text-sm text-gray-500 dark:text-gray-500 mb-6">Players will no longer be able to register. Match history and stats will be preserved.</p>
+            <p class="text-sm text-gray-600 dark:text-gray-400 mb-4">Ending <strong class="text-gray-900 dark:text-white">{{ $endingGameName }}</strong>. Players will no longer be able to register.</p>
+
+            @if (!empty($endingRankedPlayers))
+                <p class="text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wider mb-2">🏆 Tag Winner <span class="normal-case font-normal text-gray-400">(optional)</span></p>
+                <div class="divide-y divide-gray-100 dark:divide-gray-700 rounded-lg border border-gray-200 dark:border-gray-700 mb-5 max-h-56 overflow-y-auto">
+                    @foreach ($endingRankedPlayers as $i => $rp)
+                        <button wire:click="$set('endingWinnerId', {{ $endingWinnerId === $rp['id'] ? 'null' : $rp['id'] }})" class="w-full flex items-center justify-between px-4 py-2.5 transition text-left {{ $endingWinnerId === $rp['id'] ? 'bg-yellow-50 dark:bg-yellow-900/20' : 'hover:bg-gray-50 dark:hover:bg-gray-800' }}">
+                            <div class="flex items-center gap-2">
+                                <span class="text-sm">{{ $i === 0 ? '🥇' : ($i === 1 ? '🥈' : ($i === 2 ? '🥉' : ($i + 1) . '.')) }}</span>
+                                <span class="text-sm font-medium text-gray-900 dark:text-white">{{ $rp['name'] }}</span>
+                            </div>
+                            <div class="flex items-center gap-3">
+                                <span class="text-xs text-gray-400">{{ $rp['wins'] }}W / {{ $rp['losses'] }}L</span>
+                                @if ($endingWinnerId === $rp['id'])
+                                    <span class="text-xs px-2 py-0.5 rounded-full bg-yellow-100 text-yellow-700 dark:bg-yellow-900/40 dark:text-yellow-400 font-medium">Winner</span>
+                                @endif
+                            </div>
+                        </button>
+                    @endforeach
+                </div>
+            @endif
+
             <div class="flex gap-3">
                 <button x-on:click="$dispatch('close-modal', 'confirm-end')" class="flex-1 py-2 rounded-lg border border-gray-200 dark:border-gray-700 text-sm font-medium text-gray-600 dark:text-gray-400 hover:bg-gray-50 dark:hover:bg-gray-800 transition">Cancel</button>
                 <button wire:click="confirmEndGame" class="flex-1 py-2 rounded-lg bg-red-600 hover:bg-red-700 text-white text-sm font-medium transition">End Game</button>

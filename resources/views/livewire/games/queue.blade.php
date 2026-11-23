@@ -34,6 +34,7 @@ new #[Layout('layouts.app')] class extends Component
 
     // Stats modal
     public bool $showStats = false;
+    public bool $queueDetached = false;
 
     // Player profile modal
     public ?int $viewingPlayerId = null;
@@ -49,6 +50,7 @@ new #[Layout('layouts.app')] class extends Component
 
     // Player list modal
     public string $playerListSearch = '';
+    public array $selectedPlayerIds = [];
 
     // Switch player modal
     public ?int $switchMatchPlayerId = null;
@@ -155,7 +157,7 @@ new #[Layout('layouts.app')] class extends Component
         // Load active request groups first so their players can be excluded from the general queue
         $requestGroups = RequestGroup::with('players')
             ->where('game_id', $this->game->id)
-            ->whereIn('status', ['pending', 'ready'])
+            ->whereIn('status', ['pending', 'ready', 'assigned'])
             ->latest()
             ->get()
             ->map(function ($rg) {
@@ -278,6 +280,22 @@ new #[Layout('layouts.app')] class extends Component
             $upNext = $upNext->sortBy('queued_at')->values();
         }
 
+        // Merge ready request groups into upNext so they sort by queued_at alongside regular sets
+        foreach ($requestGroups->where('status', 'ready') as $rg) {
+            $players = $rg->players->filter(fn($p) => $p->status === 'queued')->values();
+            if ($players->isEmpty()) continue;
+            $upNext->push([
+                'label'      => '🎯 Request',
+                'color'      => 'text-purple-600 dark:text-purple-400',
+                'level_key'  => null,
+                'players'    => $players,
+                'queued_at'  => $players->min('queued_at'),
+                'ready'      => true,
+                'request_group_id' => $rg->id,
+            ]);
+        }
+        $upNext = $upNext->sortBy('queued_at')->values();
+
         // Detect courts where the current group has played together before
         $repeatCourtIds = $courts->filter(function ($court) {
             $match = $court->currentMatch;
@@ -352,7 +370,7 @@ new #[Layout('layouts.app')] class extends Component
 
     public function assignUpNext(array $playerIds): void
     {
-        $courts = $this->game->courts()->where('status', 'idle')->get();
+        $courts = $this->game->courts()->where('status', 'idle')->where('active', true)->get();
         abort_if($courts->isEmpty(), 403);
 
         $court   = $courts->first();
@@ -366,6 +384,30 @@ new #[Layout('layouts.app')] class extends Component
     }
 
     // Toggle court type between singles/doubles
+    public function addCourt(): void
+    {
+        $next = ($this->game->courts()->max('court_number') ?? 0) + 1;
+        $code = strtoupper(\Illuminate\Support\Str::random(6));
+        while (\App\Models\Court::where('code', $code)->exists()) {
+            $code = strtoupper(\Illuminate\Support\Str::random(6));
+        }
+        $this->game->courts()->create([
+            'court_number' => $next,
+            'type'         => 'doubles',
+            'status'       => 'idle',
+            'idled_at'     => now(),
+            'code'         => $code,
+        ]);
+        $this->game->increment('number_of_courts');
+    }
+
+    public function toggleCourtActive(Court $court): void
+    {
+        abort_unless($court->game_id === $this->game->id, 403);
+        abort_if($court->isPlaying() || $court->isAssigned(), 403);
+        $court->update(['active' => !$court->active]);
+    }
+
     public function toggleCourtType(Court $court): void
     {
         abort_unless($court->game_id === $this->game->id, 403);
@@ -377,6 +419,7 @@ new #[Layout('layouts.app')] class extends Component
     {
         abort_unless($court->game_id === $this->game->id, 403);
         abort_if(!$court->isIdle(), 403);
+        abort_unless($court->isActive(), 403);
 
         $needed = $court->type === 'doubles' ? 4 : 2;
         $queue  = $this->game->players()->where('status', 'queued')->oldest()->get();
@@ -409,7 +452,7 @@ new #[Layout('layouts.app')] class extends Component
     // Auto-assign players to all idle courts
     public function autoAssign(): void
     {
-        $courts = $this->game->courts()->where('status', 'idle')->get();
+        $courts = $this->game->courts()->where('status', 'idle')->where('active', true)->get();
         $queue  = $this->game->players()->where('status', 'queued')->oldest()->get();
 
         foreach ($courts as $court) {
@@ -571,14 +614,15 @@ new #[Layout('layouts.app')] class extends Component
         return $picked->take($needed);
     }
 
-    private function createMatch(Court $court, \Illuminate\Support\Collection $players): void
+    private function createMatch(Court $court, \Illuminate\Support\Collection $players, ?int $requestGroupId = null): void
     {
-        DB::transaction(function () use ($court, $players) {
+        DB::transaction(function () use ($court, $players, $requestGroupId) {
             $ids = $players->pluck('id')->sort()->values()->implode(',');
             $match = $court->matches()->create([
                 'status'            => 'ongoing',
                 'group_fingerprint' => $ids,
                 'pairing_mode'      => $this->game->pairing_mode,
+                'request_group_id'  => $requestGroupId,
             ]);
 
             $half = (int) ceil($players->count() / 2);
@@ -672,12 +716,23 @@ new #[Layout('layouts.app')] class extends Component
         abort_unless($court->isAssigned(), 403);
 
         DB::transaction(function () use ($court) {
-            $now = now();
-            foreach ($court->currentMatch->matchPlayers as $mp) {
+            $match = $court->currentMatch;
+            $rgId  = $match->request_group_id;
+
+            $now = $this->endOfQueueTimestamp();
+
+            foreach ($match->matchPlayers as $mp) {
                 $mp->player->update(['status' => 'queued', 'queued_at' => $now]);
             }
-            $court->currentMatch->delete();
-            $court->update(['status' => 'idle', 'idled_at' => $now]);
+            $match->delete();
+            $court->update(['status' => 'idle', 'idled_at' => now()]);
+
+            // If this match came from a request group, restore it to ready at end of queue
+            if ($rgId) {
+                RequestGroup::where('id', $rgId)
+                    ->where('game_id', $this->game->id)
+                    ->update(['status' => 'ready']);
+            }
         });
     }
 
@@ -843,6 +898,7 @@ new #[Layout('layouts.app')] class extends Component
 
         DB::transaction(function () use ($match, $court, $winningTeam, $losingTeam) {
             $finishedAt = now();
+            $endOfQueue = $this->endOfQueueTimestamp();
 
             $match->update([
                 'status'      => 'finished',
@@ -860,7 +916,7 @@ new #[Layout('layouts.app')] class extends Component
 
                 $newStatus = ($mp->team === $winningTeam && $this->winnersStay) ? 'playing' : 'queued';
                 $increment = $result === 'win' ? ['wins' => DB::raw('wins + 1')] : ['losses' => DB::raw('losses + 1')];
-                $queuedAt  = $newStatus === 'queued' ? ['queued_at' => $finishedAt] : [];
+                $queuedAt  = $newStatus === 'queued' ? ['queued_at' => $endOfQueue] : [];
 
                 $noviceCredit = [];
                 if ($hasNovice && $mp->player->level !== 'novice' && $mp->player->play_with_novice && $mp->player->novice_play_count > 0) {
@@ -929,9 +985,17 @@ new #[Layout('layouts.app')] class extends Component
     {
         abort_unless(count($this->requestPlayerIds) === 4, 422);
 
+        $alreadyRequestedIds = RequestGroup::with('players')
+            ->where('game_id', $this->game->id)
+            ->whereIn('status', ['pending', 'ready', 'assigned'])
+            ->get()
+            ->flatMap(fn($rg) => $rg->players->pluck('id'))
+            ->unique();
+
         $players = $this->game->players()
             ->whereIn('id', $this->requestPlayerIds)
             ->whereIn('status', ['queued', 'playing'])
+            ->whereNotIn('id', $alreadyRequestedIds)
             ->get();
 
         abort_unless($players->count() === 4, 422);
@@ -960,7 +1024,9 @@ new #[Layout('layouts.app')] class extends Component
 
     public function cancelRequestGroup(int $id): void
     {
-        $rg = RequestGroup::where('game_id', $this->game->id)->findOrFail($id);
+        $rg = RequestGroup::where('game_id', $this->game->id)
+            ->whereIn('status', ['pending', 'ready', 'assigned'])
+            ->findOrFail($id);
         $rg->update(['status' => 'cancelled']);
     }
 
@@ -969,18 +1035,89 @@ new #[Layout('layouts.app')] class extends Component
         $rg = RequestGroup::with('players')->where('game_id', $this->game->id)->findOrFail($id);
         abort_unless($rg->isReady(), 403);
 
-        $courts = $this->game->courts()->where('status', 'idle')->get();
+        $courts = $this->game->courts()->where('status', 'idle')->where('active', true)->get();
         abort_if($courts->isEmpty(), 403);
 
         $players = $rg->players()->whereIn('status', ['queued'])->get();
         abort_unless($players->count() === 4, 403);
 
-        $this->createMatch($courts->first(), $players);
-        $rg->update(['status' => 'cancelled']);
+        $this->createMatch($courts->first(), $players, $rg->id);
+        $rg->update(['status' => 'assigned']);
     }
+    public function toggleBulkPlayer(int $playerId): void
+    {
+        if (in_array($playerId, $this->selectedPlayerIds)) {
+            $this->selectedPlayerIds = array_values(array_filter($this->selectedPlayerIds, fn($id) => $id !== $playerId));
+        } else {
+            $this->selectedPlayerIds[] = $playerId;
+        }
+    }
+
+    public function bulkReactivate(): void
+    {
+        $this->game->players()
+            ->whereIn('id', $this->selectedPlayerIds)
+            ->where('status', 'inactive')
+            ->each(fn($p) => $p->update(['status' => 'queued', 'queued_at' => now()]));
+        $this->selectedPlayerIds = [];
+    }
+
+    public function bulkDeactivate(): void
+    {
+        $this->game->players()
+            ->whereIn('id', $this->selectedPlayerIds)
+            ->where('status', '!=', 'playing')
+            ->each(fn($p) => $p->update(['status' => 'inactive']));
+        $this->selectedPlayerIds = [];
+    }
+
+    public function selectAllPlayers(): void
+    {
+        $this->selectedPlayerIds = $this->game->players()
+            ->when($this->playerListSearch, fn($q) => $q->where('name', 'like', '%' . $this->playerListSearch . '%'))
+            ->where('status', '!=', 'playing')
+            ->pluck('id')
+            ->toArray();
+    }
+
+    private function endOfQueueTimestamp(): \Carbon\Carbon
+    {
+        $latestQueued = $this->game->players()
+            ->where('status', 'queued')
+            ->max('queued_at');
+
+        $latestRgQueued = RequestGroup::with('players')
+            ->where('game_id', $this->game->id)
+            ->whereIn('status', ['pending', 'ready'])
+            ->get()
+            ->flatMap(fn($rg) => $rg->players)
+            ->max('queued_at');
+
+        $latest = collect([$latestQueued, $latestRgQueued])->filter()->max();
+        return \Carbon\Carbon::parse($latest ?? now())->addSecond();
+    }
+
+    public function restartTimer(): void
+    {
+        $now = now();
+        $this->game->update(['started_at' => $now]);
+        $this->game->players()
+            ->where('status', 'queued')
+            ->update(['queued_at' => $now]);
+        $this->game->refresh();
+    }
+
+    public function resetQueue(): void
+    {
+        $this->game->players()
+            ->where('status', '!=', 'playing')
+            ->update(['status' => 'queued', 'queued_at' => now(), 'queued_mode' => null]);
+    }
+
     public function openPlayerList(): void
     {
-        $this->playerListSearch = '';
+        $this->playerListSearch  = '';
+        $this->selectedPlayerIds = [];
         $this->dispatch('open-modal', 'player-list');
     }
 
@@ -1046,31 +1183,37 @@ new #[Layout('layouts.app')] class extends Component
                         x-text="elapsed"
                         class="font-mono text-green-600 dark:text-green-400"
                     ></span>
+                    <button wire:click="restartTimer" title="Restart game timer" class="ml-1 text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 transition text-xs">↺</button>
                 @endif
             </p>
         </div>
-        <div class="flex items-center gap-3">
+        <div class="flex items-center gap-2">
             @if ($game->auto_assign)
                 <x-primary-button wire:click="autoAssign">⚡ Auto Assign</x-primary-button>
             @endif
-            <button wire:click="openStats" class="text-sm px-3 py-1.5 rounded-lg border border-gray-200 dark:border-gray-700 text-gray-600 dark:text-gray-400 hover:border-gray-300 dark:hover:border-gray-500 transition">
-                📊 Stats
-            </button>
-            <button wire:click="openPlayerList" class="text-sm px-3 py-1.5 rounded-lg border border-gray-200 dark:border-gray-700 text-gray-600 dark:text-gray-400 hover:border-gray-300 dark:hover:border-gray-500 transition">
-                👥 Players
-            </button>
-            <button wire:click="openHistory" class="text-sm px-3 py-1.5 rounded-lg border border-gray-200 dark:border-gray-700 text-gray-600 dark:text-gray-400 hover:border-gray-300 dark:hover:border-gray-500 transition">
-                📋 History
-            </button>
             @if (in_array($game->pairing_mode, ['level', 'win_loss']))
-                <button wire:click="openRequestGroup" class="text-sm px-3 py-1.5 rounded-lg border border-purple-300 dark:border-purple-700 text-purple-600 dark:text-purple-400 hover:bg-purple-50 dark:hover:bg-purple-900/20 transition">
+                <button wire:click="openRequestGroup" class="text-sm px-3 py-1.5 rounded-lg border border-purple-300 dark:border-purple-700 text-purple-600 dark:text-purple-400 hover:bg-purple-50 dark:hover:bg-purple-900/20 transition font-medium">
                     🎯 Request
                 </button>
             @endif
-            <a href="{{ route('games.display', $game->id) }}" target="_blank" rel="noopener" wire:navigate.off
-                class="text-sm px-3 py-1.5 rounded-lg border border-gray-200 dark:border-gray-700 text-gray-600 dark:text-gray-400 hover:border-gray-300 dark:hover:border-gray-500 transition">
-                🍻 Display
-            </a>
+            <button wire:click="openPlayerList" class="text-sm px-3 py-1.5 rounded-lg border border-gray-200 dark:border-gray-700 text-gray-600 dark:text-gray-400 hover:border-gray-300 dark:hover:border-gray-500 transition">
+                👥 Players
+            </button>
+
+            {{-- More dropdown --}}
+            <div class="relative" x-data="{ open: false }" x-on:click.outside="open = false">
+                <button x-on:click="open = !open" class="text-sm px-3 py-1.5 rounded-lg border border-gray-200 dark:border-gray-700 text-gray-600 dark:text-gray-400 hover:border-gray-300 dark:hover:border-gray-500 transition">
+                    ⋯ More
+                </button>
+                <div x-show="open" x-cloak x-transition
+                    class="absolute right-0 mt-1 w-44 bg-white dark:bg-gray-900 rounded-xl border border-gray-200 dark:border-gray-700 shadow-lg z-50 overflow-hidden">
+                    <button wire:click="openStats" x-on:click="open = false" class="w-full text-left px-4 py-2.5 text-sm text-gray-700 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-800 transition">📊 Stats</button>
+                    <button wire:click="openHistory" x-on:click="open = false" class="w-full text-left px-4 py-2.5 text-sm text-gray-700 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-800 transition">📋 History</button>
+                    <div class="border-t border-gray-100 dark:border-gray-700"></div>
+                    <button wire:click="$dispatch('open-modal', 'confirm-reset-queue')" x-on:click="open = false" class="w-full text-left px-4 py-2.5 text-sm text-red-500 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/20 transition">↺ Reset Queue</button>
+                </div>
+            </div>
+
             <a href="{{ route('games') }}" wire:navigate
                 x-on:click="localStorage.setItem('queueSeeds_{{ $game->id }}', JSON.stringify($wire.levelShuffleSeeds))"
                 class="text-sm text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200 transition">
@@ -1096,20 +1239,46 @@ new #[Layout('layouts.app')] class extends Component
         @endif
     </div>
 
-    <div class="grid grid-cols-1 lg:grid-cols-3 gap-6 items-start">
+    <div class="grid grid-cols-1 gap-6 items-start {{ $queueDetached ? '' : 'lg:grid-cols-3' }}">
 
         {{-- Courts Panel --}}
-        <div class="lg:col-span-2 space-y-4">
-            <h3 class="text-sm font-semibold text-gray-700 dark:text-gray-300 uppercase tracking-wider">Courts</h3>
+        <div class="{{ $queueDetached ? '' : 'lg:col-span-2' }} space-y-4">
+            <div class="flex items-center justify-between mb-3 h-8">
+                <h3 class="text-sm font-semibold text-gray-700 dark:text-gray-300 uppercase tracking-wider">Courts</h3>
+                <div class="flex items-center gap-2">
+                    @if ($queueDetached)
+                        <button wire:click="$set('queueDetached', false)" class="text-xs px-2.5 py-1 rounded-lg border border-gray-200 dark:border-gray-700 text-gray-600 dark:text-gray-400 hover:border-gray-300 dark:hover:border-gray-500 transition">← Show Queue</button>
+                    @endif
+                    <a href="{{ route('games.display', $game->id) }}" target="_blank" rel="noopener" wire:navigate.off
+                        class="text-xs px-2.5 py-1 rounded-lg border border-gray-200 dark:border-gray-700 text-gray-600 dark:text-gray-400 hover:border-gray-300 dark:hover:border-gray-500 transition">🍻 Display</a>
+                    <a href="{{ route('game.register', $game->token) }}" target="_blank" rel="noopener" wire:navigate.off
+                        class="text-xs px-2.5 py-1 rounded-lg border border-gray-200 dark:border-gray-700 text-gray-600 dark:text-gray-400 hover:border-gray-300 dark:hover:border-gray-500 transition">📋 Register</a>
+                    <button wire:click="addCourt" class="text-xs px-2.5 py-1 rounded-lg border border-wimbledon-300 dark:border-wimbledon-700 text-wimbledon-600 dark:text-wimbledon-400 hover:bg-wimbledon-50 dark:hover:bg-wimbledon-900/20 transition font-medium">+ Add Court</button>
+                </div>
+            </div>
 
             @foreach ($courts as $court)
                 @php $match = $court->currentMatch; @endphp
-                <div class="bg-white dark:bg-gray-900 rounded-xl border {{ $court->isPlaying() ? 'border-green-400 dark:border-green-600' : ($court->isAssigned() ? 'border-yellow-400 dark:border-yellow-600' : 'border-gray-200 dark:border-gray-700') }} p-4">
+                <div class="bg-white dark:bg-gray-900 rounded-xl border {{ $court->isPlaying() ? 'border-green-400 dark:border-green-600' : ($court->isAssigned() ? 'border-yellow-400 dark:border-yellow-600' : (!$court->active ? 'border-gray-200 dark:border-gray-700 opacity-50' : 'border-gray-200 dark:border-gray-700')) }} p-4">
                     <div class="flex items-center justify-between mb-3">
                         <div class="flex items-center gap-2">
                             <span class="font-semibold text-gray-900 dark:text-white">Court {{ $court->court_number }}</span>
+                            @if ($court->code)
+                                <a href="{{ route('court.view', $court->code) }}" target="_blank" rel="noopener" wire:navigate.off
+                                    class="text-xs font-mono px-1.5 py-0.5 rounded bg-gray-100 dark:bg-gray-800 text-gray-400 dark:text-gray-500 hover:text-gray-600 dark:hover:text-gray-300 transition" title="Court link">
+                                    {{ $court->code }}
+                                </a>
+                            @endif
                             @if (isset($repeatCourtIds[$court->id]))
                                 <span class="text-xs px-1.5 py-0.5 rounded-full bg-purple-100 text-purple-600 dark:bg-purple-900/30 dark:text-purple-400 font-medium">Same group</span>
+                            @endif
+                            {{-- Active toggle --}}
+                            @if ($court->isIdle())
+                                <button wire:click="toggleCourtActive({{ $court->id }})"
+                                    class="relative inline-flex h-4 w-7 items-center rounded-full transition {{ $court->active ? 'bg-wimbledon-600' : 'bg-gray-300 dark:bg-gray-600' }}"
+                                    title="{{ $court->active ? 'Court is on — click to turn off' : 'Court is off — click to turn on' }}">
+                                    <span class="inline-block h-3 w-3 transform rounded-full bg-white shadow transition {{ $court->active ? 'translate-x-3.5' : 'translate-x-0.5' }}"></span>
+                                </button>
                             @endif
                             <button wire:click="toggleCourtType({{ $court->id }})"
                                 class="text-xs px-2 py-0.5 rounded-full border transition
@@ -1162,22 +1331,24 @@ new #[Layout('layouts.app')] class extends Component
                                     $needed = $court->type === 'doubles' ? 4 : 2;
                                     $hasCompleteGroup = $completeGroupSizes >= $needed;
                                 @endphp
-                                <span class="text-xs text-gray-400 dark:text-gray-500">Idle</span>
-                                <button wire:click="autoAssignCourt({{ $court->id }})"
-                                    class="text-xs px-3 py-1 rounded-lg bg-wimbledon-100 text-wimbledon-700 dark:bg-wimbledon-900/30 dark:text-wimbledon-400 hover:bg-wimbledon-200 transition font-medium">
-                                    ⚡ Auto
-                                </button>
-                                @if (!$hasCompleteGroup && $queue->count() >= $needed)
-                                    <button wire:click="mixAndFillCourt({{ $court->id }})"
-                                        class="text-xs px-3 py-1 rounded-lg bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400 hover:bg-amber-200 transition font-medium" title="Mix winners and losers to fill this court">
-                                        ⇄ Mix & Fill
+                                <span class="text-xs text-gray-400 dark:text-gray-500">{{ $court->active ? 'Idle' : 'Off' }}</span>
+                                @if ($court->active)
+                                    <button wire:click="autoAssignCourt({{ $court->id }})"
+                                        class="text-xs px-3 py-1 rounded-lg bg-wimbledon-100 text-wimbledon-700 dark:bg-wimbledon-900/30 dark:text-wimbledon-400 hover:bg-wimbledon-200 transition font-medium">
+                                        ⚡ Auto
                                     </button>
-                                @endif
-                                @if (!$game->auto_assign)
-                                    <button wire:click="openManualAssign({{ $court->id }}, 1)"
-                                        class="text-xs px-3 py-1 rounded-lg bg-gray-100 text-gray-700 dark:bg-gray-700 dark:text-gray-300 hover:bg-gray-200 transition font-medium">
-                                        + Assign
-                                    </button>
+                                    @if (!$hasCompleteGroup && $queue->count() >= $needed)
+                                        <button wire:click="mixAndFillCourt({{ $court->id }})"
+                                            class="text-xs px-3 py-1 rounded-lg bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400 hover:bg-amber-200 transition font-medium" title="Mix winners and losers to fill this court">
+                                            ⇄ Mix & Fill
+                                        </button>
+                                    @endif
+                                    @if (!$game->auto_assign)
+                                        <button wire:click="openManualAssign({{ $court->id }}, 1)"
+                                            class="text-xs px-3 py-1 rounded-lg bg-gray-100 text-gray-700 dark:bg-gray-700 dark:text-gray-300 hover:bg-gray-200 transition font-medium">
+                                            + Assign
+                                        </button>
+                                    @endif
                                 @endif
                             @endif
                         </div>
@@ -1241,21 +1412,29 @@ new #[Layout('layouts.app')] class extends Component
         </div>
 
         {{-- Queue Panel --}}
-        <div class="lg:sticky lg:top-6">
-            <div class="flex items-center justify-between mb-3">
+        @if (!$queueDetached)
+        <div class="lg:sticky lg:top-6 flex flex-col max-h-[calc(100vh-6rem)] overflow-y-auto">
+            <div class="flex items-center justify-between mb-3 h-8">
                 <h3 class="text-sm font-semibold text-gray-700 dark:text-gray-300 uppercase tracking-wider">
-                    Queue <span class="text-gray-400">({{ $queue->count() }})</span>
+                    Queue <span class="text-gray-400">({{ $queue->count() + $requestGroups->where('status', 'ready')->count() }})</span>
                 </h3>
-                <span class="flex items-center gap-1 text-xs text-green-600 dark:text-green-400">
-                    <span class="w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse"></span> Live
-                </span>
+                <div class="flex items-center gap-2">
+                    <a href="{{ route('games.queue-display', $game->id) }}" target="_blank" rel="noopener" wire:navigate.off
+                        wire:click="$set('queueDetached', true)"
+                        class="text-xs px-2 py-1 rounded-lg border border-gray-200 dark:border-gray-700 text-gray-500 dark:text-gray-400 hover:border-gray-300 dark:hover:border-gray-500 transition" title="Open queue in new tab">
+                        &#x2197; Pop out
+                    </a>
+                    <span class="flex items-center gap-1 text-xs text-green-600 dark:text-green-400">
+                        <span class="w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse"></span> Live
+                    </span>
+                </div>
             </div>
 
             {{-- Pending Request Groups (waiting for players to finish) --}}
-            @if ($requestGroups->where('status', 'pending')->isNotEmpty())
+            @if ($requestGroups->where('status', 'pending')->reject(fn($rg) => $rg->isReady())->isNotEmpty())
                 <div class="mb-4 space-y-2">
                     <p class="text-xs font-semibold text-purple-600 dark:text-purple-400 uppercase tracking-wider mb-2">Requested</p>
-                    @foreach ($requestGroups->where('status', 'pending') as $rg)
+                    @foreach ($requestGroups->where('status', 'pending')->reject(fn($rg) => $rg->isReady()) as $rg)
                         <div class="bg-white dark:bg-gray-900 rounded-xl border {{ $rg->isReady() ? 'border-purple-400 dark:border-purple-600' : 'border-purple-200 dark:border-purple-800' }} overflow-hidden">
                             <div class="px-4 py-2 border-b {{ $rg->isReady() ? 'border-purple-100 dark:border-purple-800' : 'border-purple-50 dark:border-purple-900' }} flex items-center justify-between">
                                 <div class="flex items-center gap-2">
@@ -1321,55 +1500,77 @@ new #[Layout('layouts.app')] class extends Component
                         'losers'  => ['label' => 'Losers',  'color' => 'bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400 hover:bg-red-200'],
                     ];
                 @endphp
-                @if ($game->pairing_mode === 'level')
-                    <div class="flex items-center gap-2 mb-3">
-                        <label class="flex items-center gap-1.5 cursor-pointer select-none">
-                            <input type="checkbox" wire:model.live="game.strict_level" wire:change="$dispatch('toggle-strict-level')" class="sr-only peer" />
-                            <button wire:click="toggleStrictLevel" type="button"
-                                class="relative inline-flex h-4 w-7 items-center rounded-full transition {{ $game->strict_level ? 'bg-wimbledon-600' : 'bg-gray-300 dark:bg-gray-600' }}">
-                                <span class="inline-block h-3 w-3 transform rounded-full bg-white shadow transition {{ $game->strict_level ? 'translate-x-3.5' : 'translate-x-0.5' }}"></span>
-                            </button>
-                            <span class="text-xs text-gray-600 dark:text-gray-400">Same level only</span>
-                        </label>
-                    </div>
-                @endif
-                @if ($readyLevels->isNotEmpty())
-                    <div class="flex items-center gap-1.5 mb-3">
-                        @foreach ($levelButtons as $levelKey => $btn)
-                            @if ($readyLevels->contains($levelKey))
-                                <button wire:click="reshuffleLevel('{{ $levelKey }}')"
-                                    class="flex items-center gap-1 text-xs px-2.5 py-1 rounded-lg font-medium transition {{ $btn['color'] }}">
-                                    <svg xmlns="http://www.w3.org/2000/svg" class="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" /></svg>
-                                    {{ $btn['label'] }}
-                                </button>
+                @if ($game->pairing_mode === 'level' || $readyLevels->isNotEmpty())
+                    <div class="flex items-center justify-between mb-3">
+                        <div class="flex items-center gap-1.5">
+                            @if ($readyLevels->isNotEmpty())
+                                @foreach ($levelButtons as $levelKey => $btn)
+                                    @if ($readyLevels->contains($levelKey))
+                                        <button wire:click="reshuffleLevel('{{ $levelKey }}')"
+                                            class="flex items-center gap-1 text-xs px-2.5 py-1 rounded-lg font-medium transition {{ $btn['color'] }}">
+                                            <svg xmlns="http://www.w3.org/2000/svg" class="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" /></svg>
+                                            {{ $btn['label'] }}
+                                        </button>
+                                    @endif
+                                @endforeach
                             @endif
-                        @endforeach
+                        </div>
+                        @if ($game->pairing_mode === 'level')
+                            <label class="flex items-center gap-1.5 cursor-pointer select-none">
+                                <input type="checkbox" wire:model.live="game.strict_level" wire:change="$dispatch('toggle-strict-level')" class="sr-only peer" />
+                                <button wire:click="toggleStrictLevel" type="button"
+                                    class="relative inline-flex h-4 w-7 items-center rounded-full transition {{ $game->strict_level ? 'bg-wimbledon-600' : 'bg-gray-300 dark:bg-gray-600' }}">
+                                    <span class="inline-block h-3 w-3 transform rounded-full bg-white shadow transition {{ $game->strict_level ? 'translate-x-3.5' : 'translate-x-0.5' }}"></span>
+                                </button>
+                                <span class="text-xs text-gray-600 dark:text-gray-400">Same level only</span>
+                            </label>
+                        @endif
                     </div>
                 @endif
             @endif
 
             {{-- Up Next --}}
-            @if ($upNext->isNotEmpty() || $requestGroups->where('status', 'ready')->isNotEmpty())
+            @if ($upNext->isNotEmpty())
                 <div class="mb-4 space-y-2">
                     <p class="text-xs font-semibold text-wimbledon-600 dark:text-wimbledon-400 uppercase tracking-wider mb-2">Up Next</p>
+                    @php $queueNum = 1; @endphp
                     @foreach ($upNext as $set)
-                        @php $ids = $set['players']->pluck('id')->toArray(); @endphp
-                        <div class="bg-white dark:bg-gray-900 rounded-xl border {{ $set['ready'] ? 'border-wimbledon-300 dark:border-wimbledon-700' : 'border-gray-200 dark:border-gray-700' }} overflow-hidden">
-                            <div class="px-4 py-2 border-b {{ $set['ready'] ? 'border-wimbledon-100 dark:border-wimbledon-800' : 'border-gray-100 dark:border-gray-700' }} flex items-center justify-between">
+                        @php
+                            $isRequest = isset($set['request_group_id']);
+                            $ids = $set['players']->pluck('id')->toArray();
+                            $borderColor = $isRequest
+                                ? 'border-purple-400 dark:border-purple-600'
+                                : ($set['ready'] ? 'border-wimbledon-300 dark:border-wimbledon-700' : 'border-gray-200 dark:border-gray-700');
+                            $headerBorder = $isRequest
+                                ? 'border-purple-100 dark:border-purple-800'
+                                : ($set['ready'] ? 'border-wimbledon-100 dark:border-wimbledon-800' : 'border-gray-100 dark:border-gray-700');
+                        @endphp
+                        <div class="bg-white dark:bg-gray-900 rounded-xl border {{ $borderColor }} overflow-hidden">
+                            <div class="px-4 py-2 border-b {{ $headerBorder }} flex items-center justify-between">
                                 <div class="flex items-center gap-2">
+                                    <span class="text-xs font-bold text-gray-400 dark:text-gray-500 w-5">#{{ $queueNum }}</span>
                                     <span class="text-xs font-semibold {{ $set['color'] }}">{{ $set['label'] }}</span>
-                                    <span class="text-xs text-gray-400"
-                                        x-data="timer({{ $set['queued_at']->timestamp }})"
-                                        x-text="elapsed"
-                                    ></span>
+                                    @if ($isRequest)
+                                        <span class="text-xs px-1.5 py-0.5 rounded-full bg-purple-100 text-purple-600 dark:bg-purple-900/40 dark:text-purple-400 font-medium">Ready</span>
+                                    @endif
+                                    @if ($set['queued_at'])
+                                        <span class="text-xs text-gray-400"
+                                            x-data="timer({{ \Carbon\Carbon::parse($set['queued_at'])->timestamp }})"
+                                            x-text="elapsed"
+                                        ></span>
+                                    @endif
                                 </div>
                                 @if ($set['ready'])
                                     <div class="flex items-center gap-2">
-                                        <button wire:click="assignUpNext({{ json_encode($ids) }})"
-                                            class="text-xs px-2.5 py-1 rounded-lg bg-wimbledon-100 text-wimbledon-700 dark:bg-wimbledon-900/40 dark:text-wimbledon-300 hover:bg-wimbledon-200 transition font-medium">
-                                            → Assign to Court
-                                        </button>
-                                        <button wire:click="cancelUpNext({{ json_encode($ids) }})" class="text-xs text-gray-400 hover:text-red-500 transition" title="Cancel queue">✕</button>
+                                        @if ($isRequest)
+                                            <button wire:click="assignRequestGroup({{ $set['request_group_id'] }})" class="text-xs px-2.5 py-1 rounded-lg bg-purple-100 text-purple-700 dark:bg-purple-900/40 dark:text-purple-300 hover:bg-purple-200 transition font-medium">
+                                                → Assign to Court
+                                            </button>
+                                        @else
+                                            <button wire:click="assignUpNext({{ json_encode($ids) }})" class="text-xs px-2.5 py-1 rounded-lg bg-wimbledon-100 text-wimbledon-700 dark:bg-wimbledon-900/40 dark:text-wimbledon-300 hover:bg-wimbledon-200 transition font-medium">
+                                                → Assign to Court
+                                            </button>
+                                        @endif
                                     </div>
                                 @else
                                     <span class="text-xs text-gray-400 dark:text-gray-500">{{ $set['players']->count() }}/4 waiting</span>
@@ -1404,7 +1605,7 @@ new #[Layout('layouts.app')] class extends Component
                                             @if ($player->queued_at)
                                                 <div x-data="timer({{ $player->queued_at->timestamp }})"
                                                     x-text="elapsed"
-                                                    class="font-mono text-gray-400 dark:text-gray-500"
+                                                    :class="seconds >= 1800 ? 'font-mono text-red-500 dark:text-red-400 animate-pulse font-semibold' : 'font-mono text-gray-400 dark:text-gray-500'"
                                                 ></div>
                                             @endif
                                         </div>
@@ -1412,42 +1613,7 @@ new #[Layout('layouts.app')] class extends Component
                                 @endforeach
                             </div>
                         </div>
-                    @endforeach
-
-                    {{-- Ready request groups appended at end of queue --}}
-                    @foreach ($requestGroups->where('status', 'ready') as $rg)
-                        <div class="bg-white dark:bg-gray-900 rounded-xl border border-purple-400 dark:border-purple-600 overflow-hidden">
-                            <div class="px-4 py-2 border-b border-purple-100 dark:border-purple-800 flex items-center justify-between">
-                                <div class="flex items-center gap-2">
-                                    <span class="text-xs font-semibold text-purple-600 dark:text-purple-400">🎯 Request</span>
-                                    <span class="text-xs px-1.5 py-0.5 rounded-full bg-purple-100 text-purple-600 dark:bg-purple-900/40 dark:text-purple-400 font-medium">Ready</span>
-                                </div>
-                                <div class="flex items-center gap-2">
-                                    <button wire:click="assignRequestGroup({{ $rg->id }})" class="text-xs px-2.5 py-1 rounded-lg bg-purple-100 text-purple-700 dark:bg-purple-900/40 dark:text-purple-300 hover:bg-purple-200 transition font-medium">
-                                        → Assign to Court
-                                    </button>
-                                    <button wire:click="cancelRequestGroup({{ $rg->id }})" class="text-xs text-gray-400 hover:text-red-500 transition" title="Cancel">✕</button>
-                                </div>
-                            </div>
-                            <div class="divide-y divide-gray-100 dark:divide-gray-700">
-                                @foreach ($rg->players as $player)
-                                    @php
-                                        $levelColor = match($player->level) {
-                                            'novice'           => 'bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-400',
-                                            'low_intermediate' => 'bg-yellow-100 text-yellow-700 dark:bg-yellow-900/40 dark:text-yellow-400',
-                                            'hi_intermediate'  => 'bg-orange-100 text-orange-700 dark:bg-orange-900/40 dark:text-orange-400',
-                                        };
-                                    @endphp
-                                    <div class="flex items-center justify-between px-4 py-2.5">
-                                        <div class="flex items-center gap-2">
-                                            <button wire:click="openPlayerProfile({{ $player->id }})" class="text-sm font-medium text-gray-900 dark:text-white hover:text-green-600 dark:hover:text-green-400 transition text-left">{{ $player->name }}</button>
-                                            <span class="text-xs px-1.5 py-0.5 rounded-full {{ $levelColor }}">{{ $player->level_label }}</span>
-                                        </div>
-                                        <span class="text-xs text-gray-400">Queued</span>
-                                    </div>
-                                @endforeach
-                            </div>
-                        </div>
+                        @php $queueNum++; @endphp
                     @endforeach
                 </div>
             @endif
@@ -1495,6 +1661,7 @@ new #[Layout('layouts.app')] class extends Component
                 </div>
             @endif
         </div>
+        @endif
     </div>
 
     {{-- Request Group Modal --}}
@@ -1507,12 +1674,35 @@ new #[Layout('layouts.app')] class extends Component
                 </button>
             </div>
             <p class="text-sm text-gray-500 dark:text-gray-400 mb-3">Select exactly 4 players. Players currently playing will be waited on.</p>
+
+            {{-- Selected players display --}}
+            @if (count($requestPlayerIds) > 0)
+                @php $selectedPlayers = $game->players()->whereIn('id', $requestPlayerIds)->orderByRaw('FIELD(id, ' . implode(',', $requestPlayerIds) . ')')->get(); @endphp
+                <div class="flex flex-wrap gap-1.5 mb-3">
+                    @foreach ($selectedPlayers as $sp)
+                        <span class="inline-flex items-center gap-1 text-xs px-2 py-1 rounded-full bg-wimbledon-100 text-wimbledon-700 dark:bg-wimbledon-900/40 dark:text-wimbledon-300 font-medium">
+                            {{ $sp->name }}
+                            <button wire:click="toggleRequestPlayer({{ $sp->id }})" class="hover:text-red-500 transition leading-none">&times;</button>
+                        </span>
+                    @endforeach
+                    @for ($i = count($requestPlayerIds); $i < 4; $i++)
+                        <span class="inline-flex items-center text-xs px-2 py-1 rounded-full border border-dashed border-gray-300 dark:border-gray-600 text-gray-400">Empty</span>
+                    @endfor
+                </div>
+            @endif
+
             <div class="flex items-center gap-2 mb-3">
                 <input x-model="search" type="text" placeholder="Search by name…"
                     class="flex-1 text-sm rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900 text-gray-900 dark:text-white px-3 py-1.5 focus:outline-none focus:ring-1 focus:ring-wimbledon-500" />
                 <span class="text-xs font-medium {{ count($requestPlayerIds) === 4 ? 'text-green-600 dark:text-green-400' : 'text-gray-500 dark:text-gray-400' }}">{{ count($requestPlayerIds) }}/4</span>
             </div>
             @php
+                $alreadyRequestedPlayerIds = RequestGroup::with('players')
+                    ->where('game_id', $game->id)
+                    ->whereIn('status', ['pending', 'ready', 'assigned'])
+                    ->get()
+                    ->flatMap(fn($rg) => $rg->players->pluck('id'))
+                    ->unique();
                 $allSelectablePlayers = $game->players()
                     ->whereIn('status', ['queued', 'playing'])
                     ->orderBy('name')
@@ -1521,16 +1711,19 @@ new #[Layout('layouts.app')] class extends Component
             <div class="divide-y divide-gray-100 dark:divide-gray-700 max-h-72 overflow-y-auto rounded-lg border border-gray-200 dark:border-gray-700 mb-4">
                 @forelse ($allSelectablePlayers as $player)
                     @php
-                        $selected = in_array($player->id, $requestPlayerIds);
+                        $selected   = in_array($player->id, $requestPlayerIds);
+                        $inOtherRg  = !$selected && $alreadyRequestedPlayerIds->contains($player->id);
+                        $disabled   = $inOtherRg || (!$selected && count($requestPlayerIds) >= 4);
                         $levelColor = match($player->level) {
                             'novice'           => 'bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-400',
                             'low_intermediate' => 'bg-yellow-100 text-yellow-700 dark:bg-yellow-900/40 dark:text-yellow-400',
                             'hi_intermediate'  => 'bg-orange-100 text-orange-700 dark:bg-orange-900/40 dark:text-orange-400',
                         };
                     @endphp
-                    <button wire:click="toggleRequestPlayer({{ $player->id }})"
+                    <button wire:click="{{ $disabled ? '' : 'toggleRequestPlayer(' . $player->id . ')' }}"
                         x-show="search === '' || '{{ strtolower($player->name) }}'.includes(search.toLowerCase())"
-                        class="w-full flex items-center justify-between px-4 py-3 transition text-left {{ $selected ? 'bg-purple-50 dark:bg-purple-900/20' : 'hover:bg-gray-50 dark:hover:bg-gray-800' }} {{ !$selected && count($requestPlayerIds) >= 4 ? 'opacity-40 cursor-not-allowed' : '' }}">
+                        {{ $disabled ? 'disabled' : '' }}
+                        class="w-full flex items-center justify-between px-4 py-3 transition text-left {{ $selected ? 'bg-purple-50 dark:bg-purple-900/20' : '' }} {{ $disabled ? 'opacity-40 cursor-not-allowed' : 'hover:bg-gray-50 dark:hover:bg-gray-800' }}">
                         <div class="flex items-center gap-2">
                             <span class="w-4 h-4 rounded border flex items-center justify-center flex-shrink-0 {{ $selected ? 'bg-purple-600 border-purple-600' : 'border-gray-300 dark:border-gray-600' }}">
                                 @if ($selected)
@@ -1541,7 +1734,9 @@ new #[Layout('layouts.app')] class extends Component
                             <span class="text-xs px-1.5 py-0.5 rounded-full {{ $levelColor }}">{{ $player->level_label }}</span>
                         </div>
                         <div class="flex items-center gap-2">
-                            @if ($player->status === 'playing')
+                            @if ($inOtherRg)
+                                <span class="text-xs text-purple-500 dark:text-purple-400">Requested</span>
+                            @elseif ($player->status === 'playing')
                                 <span class="flex items-center gap-1 text-xs text-green-600 dark:text-green-400">
                                     <span class="w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse"></span> Playing
                                 </span>
@@ -1575,8 +1770,18 @@ new #[Layout('layouts.app')] class extends Component
                 </div>
             </div>
 
-            <input wire:model.live="playerListSearch" type="text" placeholder="Search by name…"
-                class="w-full text-sm rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900 text-gray-900 dark:text-white px-3 py-1.5 mb-4 focus:outline-none focus:ring-1 focus:ring-wimbledon-500" />
+            <div class="flex items-center gap-2 mb-4">
+                <input wire:model.live="playerListSearch" type="text" placeholder="Search by name…"
+                    class="flex-1 text-sm rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900 text-gray-900 dark:text-white px-3 py-1.5 focus:outline-none focus:ring-1 focus:ring-wimbledon-500" />
+                @php $allSelectableIds = $this->game->players()->when($playerListSearch, fn($q) => $q->where('name', 'like', '%' . $playerListSearch . '%'))->where('status', '!=', 'playing')->pluck('id')->toArray(); @endphp
+                <label class="flex items-center gap-1.5 cursor-pointer flex-shrink-0">
+                    <input type="checkbox"
+                        wire:click="{{ count($selectedPlayerIds) === count($allSelectableIds) && count($allSelectableIds) > 0 ? '$set(\'selectedPlayerIds\', [])' : 'selectAllPlayers' }}"
+                        {{ count($selectedPlayerIds) === count($allSelectableIds) && count($allSelectableIds) > 0 ? 'checked' : '' }}
+                        class="w-4 h-4 rounded border-gray-300 text-wimbledon-600 focus:ring-wimbledon-500" />
+                    <span class="text-xs text-gray-500 dark:text-gray-400">All</span>
+                </label>
+            </div>
 
             @php
                 $allPlayers = $this->game->players()
@@ -1617,6 +1822,10 @@ new #[Layout('layouts.app')] class extends Component
                                     @endphp
                                     <div x-data="{ editingLevel: false }" class="flex items-center justify-between px-4 py-3 bg-white dark:bg-gray-900 {{ $player->isInactive() ? 'opacity-60' : '' }}">
                                         <div class="flex items-center gap-2 min-w-0">
+                                            <input type="checkbox"
+                                                wire:click="toggleBulkPlayer({{ $player->id }})"
+                                                {{ in_array($player->id, $selectedPlayerIds) ? 'checked' : '' }}
+                                                class="w-4 h-4 rounded border-gray-300 text-wimbledon-600 focus:ring-wimbledon-500 flex-shrink-0" />
                                             <span class="text-sm font-medium text-gray-900 dark:text-white truncate">{{ $player->name }}</span>
                                             <button x-show="!editingLevel" x-on:click="editingLevel = true"
                                                 class="text-xs px-1.5 py-0.5 rounded-full {{ $levelColor }} flex-shrink-0 hover:opacity-75 transition">{{ $player->level_label }}</button>
@@ -1652,10 +1861,37 @@ new #[Layout('layouts.app')] class extends Component
                     <p class="text-sm text-gray-400 dark:text-gray-500 text-center py-8">No players found.</p>
                 @endif
             </div>
+
+            {{-- Bulk actions --}}
+            @if (count($selectedPlayerIds) > 0)
+                <div class="mt-4 flex items-center gap-3 pt-4 border-t border-gray-200 dark:border-gray-700">
+                    <span class="text-xs text-gray-500 dark:text-gray-400">{{ count($selectedPlayerIds) }} selected</span>
+                    <button wire:click="bulkReactivate" class="text-xs px-3 py-1.5 rounded-lg bg-wimbledon-100 text-wimbledon-700 dark:bg-wimbledon-900/40 dark:text-wimbledon-300 hover:bg-wimbledon-200 transition font-medium">Re-add to Queue</button>
+                    <button wire:click="bulkDeactivate" class="text-xs px-3 py-1.5 rounded-lg bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-400 hover:bg-amber-200 transition font-medium">Deactivate</button>
+                    <button wire:click="$set('selectedPlayerIds', [])" class="text-xs text-gray-400 hover:text-gray-600 transition">Clear</button>
+                </div>
+            @endif
         </div>
     </x-modal>
 
-    {{-- Skip Confirm Modal --}}
+    {{-- Reset Queue Modal --}}
+    <x-modal name="confirm-reset-queue" maxWidth="sm">
+        <div class="p-6">
+            <div class="flex items-center justify-between mb-4">
+                <h3 class="text-base font-semibold text-gray-900 dark:text-white">Reset Queue</h3>
+                <button x-on:click="$dispatch('close-modal', 'confirm-reset-queue')" class="text-gray-400 hover:text-gray-600 transition">
+                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/></svg>
+                </button>
+            </div>
+            <p class="text-sm text-gray-600 dark:text-gray-400 mb-1">All non-playing players will be re-queued and all wait timers will be reset.</p>
+            <p class="text-sm text-gray-500 dark:text-gray-500 mb-6">Players currently on court are not affected.</p>
+            <div class="flex gap-3">
+                <button x-on:click="$dispatch('close-modal', 'confirm-reset-queue')" class="flex-1 py-2 rounded-lg border border-gray-200 dark:border-gray-700 text-sm font-medium text-gray-600 dark:text-gray-400 hover:bg-gray-50 dark:hover:bg-gray-800 transition">Cancel</button>
+                <button wire:click="resetQueue" x-on:click="$dispatch('close-modal', 'confirm-reset-queue')" class="flex-1 py-2 rounded-lg bg-red-600 hover:bg-red-700 text-white text-sm font-medium transition">Reset Queue</button>
+            </div>
+        </div>
+    </x-modal>
+
     <x-modal name="confirm-action" maxWidth="sm">
         <div class="p-6">
             <div class="flex items-center justify-between mb-3">
@@ -1974,9 +2210,22 @@ new #[Layout('layouts.app')] class extends Component
             <p class="text-sm text-gray-500 dark:text-gray-400 mb-3">Optionally replace with a queued player, or just send to rest.</p>
             <div class="divide-y divide-gray-100 dark:divide-gray-700 max-h-64 overflow-y-auto rounded-lg border border-gray-200 dark:border-gray-700 mb-4">
                 @forelse ($queue as $player)
+                    @php
+                        $levelColor = match($player->level) {
+                            'novice'           => 'bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-400',
+                            'low_intermediate' => 'bg-yellow-100 text-yellow-700 dark:bg-yellow-900/40 dark:text-yellow-400',
+                            'hi_intermediate'  => 'bg-orange-100 text-orange-700 dark:bg-orange-900/40 dark:text-orange-400',
+                        };
+                    @endphp
                     <button wire:click="restPlayer({{ $player->id }})" class="w-full flex items-center justify-between px-4 py-3 hover:bg-wimbledon-50 dark:hover:bg-wimbledon-900/20 transition text-left">
-                        <button wire:click="openPlayerProfile({{ $player->id }})" class="text-sm font-medium text-gray-900 dark:text-white hover:text-green-600 dark:hover:text-green-400 transition text-left">{{ $player->name }}{{ $player->novice_play_count > 0 ? ' ' . str_repeat('😊', $player->novice_play_count) : '' }}{{ $player->low_intermediate_play_count > 0 ? ' ' . str_repeat('🤝', $player->low_intermediate_play_count) : '' }}</button>
-                        <span class="text-xs text-gray-500 dark:text-gray-400">{{ $player->level_label }} · {{ ucfirst($player->gender) }}</span>
+                        <div>
+                            <p class="text-sm font-medium text-gray-900 dark:text-white">{{ $player->name }}{{ $player->novice_play_count > 0 ? ' ' . str_repeat('😊', $player->novice_play_count) : '' }}{{ $player->low_intermediate_play_count > 0 ? ' ' . str_repeat('🤝', $player->low_intermediate_play_count) : '' }}</p>
+                            <div class="flex items-center gap-1.5 mt-0.5">
+                                <span class="text-xs px-1.5 py-0.5 rounded-full {{ $levelColor }}">{{ $player->level_label }}</span>
+                                <span class="text-xs text-gray-400 capitalize">{{ $player->gender }}</span>
+                            </div>
+                        </div>
+                        <span class="text-xs text-wimbledon-600 dark:text-wimbledon-400 font-medium">Replace →</span>
                     </button>
                 @empty
                     <p class="px-4 py-3 text-sm text-gray-400 dark:text-gray-500">No players in queue</p>
@@ -2162,6 +2411,7 @@ new #[Layout('layouts.app')] class extends Component
 
     Alpine.data('timer', (start, hms = false) => ({
         elapsed: '',
+        seconds: 0,
         _interval: null,
         init() {
             this.tick();
@@ -2172,6 +2422,7 @@ new #[Layout('layouts.app')] class extends Component
         },
         tick() {
             const s = Math.max(0, Math.floor(Date.now() / 1000) - start);
+            this.seconds = s;
             if (hms) {
                 const h = Math.floor(s / 3600);
                 const m = Math.floor((s % 3600) / 60);

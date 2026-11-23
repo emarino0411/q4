@@ -56,6 +56,7 @@ new #[Layout('layouts.guest')] class extends Component
             'novice_play_count'           => $this->play_with_novice ? max(1, $this->novice_play_count) : 0,
             'play_with_low_intermediate'         => $this->level === 'hi_intermediate' ? $this->play_with_low_intermediate : false,
             'low_intermediate_play_count'         => ($this->level === 'hi_intermediate' && $this->play_with_low_intermediate) ? max(1, $this->low_intermediate_play_count) : 0,
+            'status'            => 'queued',
             'queued_at'         => now(),
             'queued_mode'       => $this->game->pending_pairing_mode,
         ]);

@@ -19,6 +19,7 @@ new #[Layout('layouts.display')] class extends Component
     public function with(): array
     {
         $this->game->refresh();
+        $this->game->load('winner');
 
         if ($this->game->isEnded()) {
             $topPlayers = $this->game->players()
@@ -156,6 +157,15 @@ new #[Layout('layouts.display')] class extends Component
             <h1 class="text-4xl font-bold text-gray-900 dark:text-white mb-2">That's a wrap!</h1>
             <p class="text-lg text-gray-500 dark:text-gray-400 mb-1">{{ $game->name }}</p>
             <p class="text-sm text-gray-400 dark:text-gray-500">{{ $game->date->format('F d, Y') }}</p>
+            @if ($game->winner_player_id && $game->winner)
+                <div class="mt-6 inline-flex items-center gap-3 px-6 py-3 rounded-2xl bg-yellow-50 dark:bg-yellow-900/20 border-2 border-yellow-300 dark:border-yellow-600">
+                    <span class="text-3xl">🏆</span>
+                    <div class="text-left">
+                        <p class="text-xs font-semibold text-yellow-600 dark:text-yellow-400 uppercase tracking-wider">Winner</p>
+                        <p class="text-xl font-bold text-gray-900 dark:text-white">{{ $game->winner->name }}</p>
+                    </div>
+                </div>
+            @endif
         </div>
 
         @if (collect($topPlayers)->flatten(1)->isNotEmpty())

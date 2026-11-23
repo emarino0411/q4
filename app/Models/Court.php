@@ -9,10 +9,11 @@ use Illuminate\Database\Eloquent\Relations\HasOne;
 
 class Court extends Model
 {
-    protected $fillable = ['game_id', 'court_number', 'type', 'status', 'idled_at'];
+    protected $fillable = ['game_id', 'court_number', 'type', 'status', 'idled_at', 'active', 'code'];
 
     protected $casts = [
         'idled_at' => 'datetime',
+        'active'   => 'boolean',
     ];
 
     public function game(): BelongsTo
@@ -33,4 +34,5 @@ class Court extends Model
     public function isIdle(): bool     { return $this->status === 'idle'; }
     public function isAssigned(): bool  { return $this->status === 'assigned'; }
     public function isPlaying(): bool   { return $this->status === 'playing'; }
+    public function isActive(): bool    { return (bool) $this->active; }
 }
